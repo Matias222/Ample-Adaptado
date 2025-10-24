@@ -1,16 +1,61 @@
 import torch
 import fastchat 
 
-def load_conversation_template(template_name):
-    conv_template = fastchat.model.get_conversation_template(template_name)
-    if conv_template.name == 'zero_shot':
-        conv_template.roles = tuple(['### ' + r for r in conv_template.roles])
-        conv_template.sep = '\n'
-    elif conv_template.name == 'llama-2':
-        conv_template.sep2 = conv_template.sep2.strip()
-    
-    return conv_template
+class Llama32ConversationTemplate:
+    def __init__(self):
+        self.name = "llama-3.2"
+        self.roles = ("user","assistant")
+        self.sep = "\n\n"
+        self.turno = "<|eot_id|>"
+        self.messages = []
+        self.system = "You are a helpful assistant"
 
+    def set_system_message(self,sistema):
+        self.system=sistema
+
+    def append_message(self, role, message): self.messages.append((role, message))
+
+    def update_last_message(self, message):
+
+        role, _ = self.messages[-1]
+        self.messages[-1] = (role, message)
+
+    def get_prompt(self):
+
+        prompt="<|begin_of_text|><|start_header_id|>system<|end_header_id|>"+self.sep+self.system #sistema
+
+        for i in range(len(self.messages)):
+
+            if(self.messages[i][0]=="assistant"): 
+
+                prompt+="<|eot_id|><|start_header_id|>assistant<|end_header_id|>"+self.sep
+                
+                if(self.messages[i][1]!=None): prompt+=self.messages[i][1]
+
+            else:  
+                
+                prompt+="<|eot_id|><|start_header_id|>user<|end_header_id|>"+self.sep
+                
+                if(self.messages[i][1]!=None): prompt+=self.messages[i][1]
+
+        return prompt
+
+def load_conversation_template(template_name):
+    
+    if(template_name=="llama-3.2"):
+        
+        return Llama32ConversationTemplate()
+
+    else:
+        
+        conv_template = fastchat.model.get_conversation_template(template_name)
+        if conv_template.name == 'zero_shot':
+            conv_template.roles = tuple(['### ' + r for r in conv_template.roles])
+            conv_template.sep = '\n'
+        elif conv_template.name == 'llama-2':
+            conv_template.sep2 = conv_template.sep2.strip()
+        
+        return conv_template
 
 class SuffixManager:
     def __init__(self, *, tokenizer, conv_template, instruction, target, adv_string):
@@ -33,7 +78,7 @@ class SuffixManager:
         encoding = self.tokenizer(prompt)
         toks = encoding.input_ids
 
-        if self.conv_template.name == 'llama-2':
+        if self.conv_template.name == 'llama-2' or self.conv_template.name == 'llama-3.2':
             self.conv_template.messages = []
 
             self.conv_template.append_message(self.conv_template.roles[0], None)
@@ -55,9 +100,14 @@ class SuffixManager:
 
             self.conv_template.update_last_message(f"{self.target}")
             toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._target_slice = slice(self._assistant_role_slice.stop, len(toks)-2)
-            self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-3)
-
+            
+            if(self.conv_template.name == "llama-3.2"):
+                self._target_slice = slice(self._assistant_role_slice.stop, len(toks))
+                self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-1)
+            else:
+                self._target_slice = slice(self._assistant_role_slice.stop, len(toks)-2)
+                self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-3)
+            
         else:
             python_tokenizer = False or self.conv_template.name == 'oasst_pythia'
             try:
