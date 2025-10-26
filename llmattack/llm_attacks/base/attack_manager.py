@@ -12,7 +12,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-from fastchat.model import get_conversation_template
+from llm_attacks.minimal_gcg.string_utils import load_conversation_template as get_conversation_template
 from transformers import (AutoModelForCausalLM, AutoTokenizer, GPT2LMHeadModel,
                           GPTJForCausalLM, GPTNeoXForCausalLM,
                           LlamaForCausalLM)
@@ -66,7 +66,8 @@ def get_nonascii_toks(tokenizer, device='cpu'):
 
     ascii_toks = []
     for i in range(3, tokenizer.vocab_size):
-        if not is_ascii(tokenizer.decode([i])):
+        decoded = tokenizer.decode([i])
+        if (not is_ascii(decoded)) or ('"' in decoded) or ('\\' in decoded) or ('{{' in decoded): #Filtrar caracteres cojudones
             ascii_toks.append(i)
     
     if tokenizer.bos_token_id is not None:
@@ -79,6 +80,7 @@ def get_nonascii_toks(tokenizer, device='cpu'):
         ascii_toks.append(tokenizer.unk_token_id)
     
     return torch.tensor(ascii_toks, device=device)
+
 class AttackPrompt(object):
     """
     A class used to generate an attack prompt. 
@@ -181,28 +183,35 @@ class AttackPrompt(object):
             self.conv_template.set_system_message("You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.")
 
             self.conv_template.append_message(self.conv_template.roles[0], None)
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
+            toks = self.tokenizer(self.conv_template.get_prompt(),add_special_tokens=False).input_ids
             self._user_role_slice = slice(None, len(toks))
 
             self.conv_template.update_last_message(f"{self.goal}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
+            toks = self.tokenizer(self.conv_template.get_prompt(),add_special_tokens=False).input_ids
             self._goal_slice = slice(self._user_role_slice.stop, max(self._user_role_slice.stop, len(toks)))
 
             separator = ' ' if self.goal else ''
             self.conv_template.update_last_message(f"{self.goal}{separator}{self.control}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
+            toks = self.tokenizer(self.conv_template.get_prompt(),add_special_tokens=False).input_ids
             self._control_slice = slice(self._goal_slice.stop, len(toks))
-            print(self.tokenizer.decode(toks[self._goal_slice]))
-            print(self.tokenizer.decode(toks[self._control_slice]))
 
             self.conv_template.append_message(self.conv_template.roles[1], None)
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
+            toks = self.tokenizer(self.conv_template.get_prompt(),add_special_tokens=False).input_ids
             self._assistant_role_slice = slice(self._control_slice.stop, len(toks))
 
             self.conv_template.update_last_message(f"{self.target}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
+            toks = self.tokenizer(self.conv_template.get_prompt(),add_special_tokens=False).input_ids
             self._target_slice = slice(self._assistant_role_slice.stop, len(toks))
             self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-1)
+
+            # Imprimir prompt completo
+            #print("="*80)
+            #print("PROMPT COMPLETO:")
+            #print(self.conv_template.get_prompt())
+            #print("="*80)
+            #print(f"Goal: {self.tokenizer.decode(toks[self._goal_slice])}")
+            #print(f"Control: {self.tokenizer.decode(toks[self._control_slice])}")
+            #print("="*80)
 
         else:
             python_tokenizer = False or self.conv_template.name == 'oasst_pythia'
@@ -358,6 +367,20 @@ class AttackPrompt(object):
             attn_mask = (ids != pad_tok).type(ids.dtype)
         else:
             attn_mask = None
+
+        # Print prompt being sent to model for loss computation (only first candidate)
+        #if self.conv_template.name == 'llama-3.2':
+        #    print("\n" + "="*80)
+        #    print("PROMPT BEING FED TO MODEL FOR LOSS COMPUTATION:")
+        #    print("="*80)
+        #    print(self.tokenizer.decode(ids[0]))
+        #    print("="*80)
+        #    print(f"Control tokens slice: {self._control_slice}")
+        #    print(f"Control: {self.tokenizer.decode(ids[0][self._control_slice])}")
+        #    print(f"Target slice: {self._target_slice}")
+        #    print(f"Target: {self.tokenizer.decode(ids[0][self._target_slice])}")
+        #    print(f"Loss slice: {self._loss_slice}")
+        #    print("="*80 + "\n")
 
         if return_ids:
             del locs, test_ids ; gc.collect()
@@ -670,22 +693,41 @@ class MultiPromptAttack(object):
         for i in range(len(control)):
             self.prompts[i].control_toks = control[i]
     
+    
     def get_filtered_cands(self, worker_index, control_cand, filter_cand=True, curr_control=None):
         cands, count = [], 0
         worker = self.workers[worker_index]
+        # Obtener la longitud original del control en tokens
+        original_length = len(control_cand[0])
+
+        # Truncar candidatos que son más largos (crear nuevo tensor)
+        normalized_cands = []
+        for i in range(control_cand.shape[0]):
+            if len(control_cand[i]) > original_length:
+                # Truncar si es más largo
+                normalized_cands.append(control_cand[i][:original_length])
+            else:
+                normalized_cands.append(control_cand[i])
+
+        # Crear un NUEVO tensor con candidatos normalizados
+        control_cand = torch.stack(normalized_cands)
+
         for i in range(control_cand.shape[0]):
             decoded_str = worker.tokenizer.decode(control_cand[i], skip_special_tokens=True)
             if filter_cand:
-                if decoded_str != curr_control and len(worker.tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
+                # Verificar que al re-tokenizar mantenga la misma longitud
+                retokenized_ids = worker.tokenizer(decoded_str, add_special_tokens=False).input_ids
+                if decoded_str != curr_control and len(retokenized_ids) == original_length:
                     cands.append(decoded_str)
                 else:
                     count += 1
             else:
                 cands.append(decoded_str)
-                
+
         if filter_cand:
             cands = cands + [cands[-1]] * (len(control_cand) - len(cands))
-            # print(f"Warning: {round(count / len(control_cand), 2)} control candidates were not valid")
+            if count > 0:
+                print(f"Warning: {count}/{len(control_cand)} candidates filtered (length mismatch)")
         return cands
 
     def step(self, *args, **kwargs):
@@ -703,7 +745,7 @@ class MultiPromptAttack(object):
         control_weight=None,
         anneal=True,
         anneal_from=0,
-        prev_loss=np.infty,
+        prev_loss=np.inf,
         stop_on_success=True,
         test_steps=50,
         log_first=False,
@@ -1032,7 +1074,7 @@ class ProgressiveMultiPromptAttack(object):
         num_workers = 1 if self.progressive_models else len(self.workers)
         step = 0
         stop_inner_on_success = self.progressive_goals
-        loss = np.infty
+        loss = np.inf
 
         while step < n_steps:
             attack = self.managers['MPA'](
@@ -1073,11 +1115,11 @@ class ProgressiveMultiPromptAttack(object):
 
             if num_goals < len(self.goals):
                 num_goals += 1
-                loss = np.infty
+                loss = np.inf
             elif num_goals == len(self.goals):
                 if num_workers < len(self.workers):
                     num_workers += 1
-                    loss = np.infty
+                    loss = np.inf
                 elif num_workers == len(self.workers) and stop_on_success:
                     # model_tests = attack.test_all()
                     attack.log_multi_queries(self.control, loss)
@@ -1086,7 +1128,7 @@ class ProgressiveMultiPromptAttack(object):
                     if isinstance(control_weight, (int, float)) and incr_control:
                         if control_weight <= 0.09:
                             control_weight += 0.01
-                            loss = np.infty
+                            loss = np.inf
                             if verbose:
                                 print(f"Control weight increased to {control_weight:.5}")
                         else:
@@ -1289,7 +1331,7 @@ class IndividualPromptAttack(object):
                 control_weight=control_weight,
                 anneal=anneal,
                 anneal_from=0,
-                prev_loss=np.infty,
+                prev_loss=np.inf,
                 stop_on_success=stop_inner_on_success,
                 test_steps=test_steps,
                 log_first=False,
